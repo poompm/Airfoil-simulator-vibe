@@ -1,0 +1,435 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NACA Aerodynamics & Boundary Layer Simulator</title>
+    <style>
+        :root { --bg: #0f172a; --panel: #1e293b; --text: #f8fafc; --accent: #38bdf8; --warn: #ef4444; }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: var(--bg); color: var(--text); padding: 20px; display: flex; justify-content: center; }
+        .container { display: grid; grid-template-columns: 1fr 340px; gap: 20px; max-width: 1250px; width: 100%; }
+        
+        .canvas-container { background: #020617; border-radius: 12px; border: 1px solid #334155; position: relative; overflow: hidden; box-shadow: 0 10px 25px -5px rgba(0,0,0,0.5); }
+        canvas { display: block; width: 100%; height: 620px; }
+        
+        .controls { background: var(--panel); padding: 20px; border-radius: 12px; border: 1px solid #334155; display: flex; flex-direction: column; gap: 14px; }
+        .title { font-size: 1.4rem; color: var(--accent); font-weight: bold; text-align: center; }
+        
+        .control-group { display: flex; flex-direction: column; gap: 5px; }
+        .control-row { display: flex; justify-content: space-between; align-items: center; }
+        label { font-size: 0.88rem; font-weight: 600; color: #cbd5e1; }
+        .value { color: var(--accent); font-weight: bold; }
+        
+        input[type="range"] { width: 100%; accent-color: var(--accent); cursor: pointer; }
+        input[type="number"], select { background: #0f172a; color: white; border: 1px solid #475569; padding: 6px; border-radius: 4px; text-align: right; width: 80px; font-weight: bold;}
+        
+        .metrics { background: #0f172a; padding: 12px; border-radius: 8px; border: 1px solid #334155; margin-top: 5px; }
+        .metric-row { display: flex; justify-content: space-between; margin-bottom: 6px; font-size: 0.88rem; }
+        .badge { padding: 3px 8px; border-radius: 4px; font-size: 0.8rem; font-weight: bold; background: #10b981; color: #020617; }
+        .badge.stall { background: var(--warn); color: white; animation: pulse 1s infinite alternate; }
+        
+        .insight { background: rgba(56, 189, 248, 0.1); border-left: 3px solid var(--accent); padding: 10px; font-size: 0.82rem; color: #cbd5e1; line-height: 1.4; margin-top: auto; }
+        
+        @keyframes pulse { from { opacity: 0.7; } to { opacity: 1; } }
+        @media (max-width: 900px) { .container { grid-template-columns: 1fr; } }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <div class="canvas-container">
+        <canvas id="simCanvas" width="880" height="620"></canvas>
+    </div>
+
+    <div class="controls">
+        <div class="title" id="nacaTitle">NACA 2412</div>
+        
+        <div class="control-row">
+            <label>Visualization Mode:</label>
+            <select id="renderMode">
+                <option value="particle">Streamline Particles</option>
+                <option value="continuous">Continuous Lines</option>
+            </select>
+        </div>
+
+        <hr style="border-color: #334155;">
+
+        <div class="control-row">
+            <label>Max Camber (M, %)</label>
+            <input type="number" id="mInput" value="2" min="0" max="9">
+        </div>
+        <div class="control-row">
+            <label>Camber Position (P, %)</label>
+            <input type="number" id="pInput" value="40" min="0" max="90" step="10">
+        </div>
+        <div class="control-row">
+            <label>Thickness (T, %)</label>
+            <input type="number" id="tInput" value="12" min="1" max="40">
+        </div>
+
+        <hr style="border-color: #334155;">
+
+        <div class="control-group">
+            <label class="control-row">Angle of Attack (&alpha;) <span class="value" id="aoaVal">5.0°</span></label>
+            <input type="range" id="aoaInput" min="-10" max="25" value="5" step="0.5">
+        </div>
+        <div class="control-group">
+            <label class="control-row">Free Stream Velocity <span class="value" id="speedVal">50 kt</span></label>
+            <input type="range" id="speedInput" min="20" max="100" value="50">
+        </div>
+
+        <div class="metrics">
+            <div class="metric-row">
+                <span>Flow Regime:</span>
+                <span id="flightStatus" class="badge">Attached Flow</span>
+            </div>
+            <div class="metric-row">
+                <span>Lift Coeff (C_L):</span>
+                <span id="clDisplay" class="value">0.00</span>
+            </div>
+            <div class="metric-row">
+                <span>Drag Coeff (C_D):</span>
+                <span id="cdDisplay" class="value">0.00</span>
+            </div>
+        </div>
+
+        <div class="insight" id="insightBox">
+            Initializing Physics Engine...
+        </div>
+    </div>
+</div>
+
+<script>
+    const canvas = document.getElementById('simCanvas');
+    const ctx = canvas.getContext('2d');
+    
+    // Core Flight Parameters
+    let aoa = 5.0;            
+    let speed = 5.0;          
+    let m_val = 2, p_val = 40, t_val = 12;
+    let renderMode = 'particle';
+    
+    // Physics State 
+    let airfoilData = null;
+    let separationPointX = 1.0; 
+    let isStalled = false;
+
+    // UI Bindings
+    const UI = {
+        m: document.getElementById('mInput'), p: document.getElementById('pInput'), t: document.getElementById('tInput'),
+        aoa: document.getElementById('aoaInput'), speed: document.getElementById('speedInput'),
+        aoaVal: document.getElementById('aoaVal'), speedVal: document.getElementById('speedVal'),
+        nacaTitle: document.getElementById('nacaTitle'), mode: document.getElementById('renderMode'),
+        status: document.getElementById('flightStatus'), cl: document.getElementById('clDisplay'), cd: document.getElementById('cdDisplay'),
+        insight: document.getElementById('insightBox')
+    };
+
+    function updatePhysicsState() {
+        // Safe parsing to prevent NaN crashes
+        m_val = parseInt(UI.m.value) || 0;
+        p_val = parseInt(UI.p.value) || 0;
+        t_val = Math.max(1, parseInt(UI.t.value) || 12);
+        aoa = parseFloat(UI.aoa.value) || 0;
+        speed = (parseInt(UI.speed.value) || 50) / 10;
+
+        const p_digit = p_val / 10;
+        const t_str = t_val < 10 ? "0" + t_val : t_val;
+        UI.nacaTitle.innerText = `NACA ${m_val}${p_digit}${t_str} AIRFOIL`;
+
+        // Calculate Aerodynamic Stall & Separation Point
+        const stallAngle = 13.5 + (t_val / 12);
+        isStalled = aoa > stallAngle;
+
+        if (aoa <= 5) {
+            separationPointX = 1.0;
+        } else if (aoa <= stallAngle) {
+            // Separation moves forward gently
+            separationPointX = 1.0 - Math.pow((aoa - 5) / (stallAngle - 5), 1.2) * 0.45;
+        } else {
+            // Sudden stall drop
+            separationPointX = Math.max(0.1, 0.55 - (aoa - stallAngle) * 0.05);
+        }
+
+        // Lift & Drag estimation based on thin airfoil theory
+        let cl = 0, cd = 0;
+        const zeroLiftAoA = - (m_val * 0.11); 
+
+        if (!isStalled) {
+            cl = 0.11 * (aoa - zeroLiftAoA);
+            cd = 0.008 + (t_val / 1000) + Math.pow(cl, 2) / (Math.PI * 6.5);
+            
+            UI.status.innerText = "Attached Flow"; 
+            UI.status.className = "badge";
+            UI.insight.innerText = "Favorable pressure gradient. Streamlines flow perfectly parallel to the airfoil contour, transferring momentum efficiently.";
+        } else {
+            cl = 0.11 * (stallAngle - zeroLiftAoA) - (aoa - stallAngle) * 0.06;
+            cd = 0.06 + Math.pow((aoa - stallAngle) * 0.08, 1.8);
+            
+            UI.status.innerText = "STALL / SEPARATION"; 
+            UI.status.className = "badge stall";
+            UI.insight.innerText = "Adverse pressure gradient causes boundary layer separation (du/dy = 0). Flow detaches, creating a low-pressure wake.";
+        }
+
+        UI.cl.innerText = cl.toFixed(2); 
+        UI.cd.innerText = cd.toFixed(2);
+    }
+
+    // Mathematical surface evaluator to enforce tangency
+    function getSurfaceY(normX, isUpper) {
+        if (normX < 0) normX = 0;
+        if (normX > 1) normX = 1;
+        
+        const m = m_val / 100, p = p_val / 100, t = t_val / 100;
+        const chord = 380;
+        
+        let yt = (t / 0.2) * (0.2969 * Math.sqrt(normX) - 0.1260 * normX - 0.3516 * Math.pow(normX, 2) + 0.2843 * Math.pow(normX, 3) - 0.1015 * Math.pow(normX, 4));
+        let yc = 0;
+        
+        if (p > 0) {
+            if (normX < p) yc = (m / Math.pow(p, 2)) * (2 * p * normX - Math.pow(normX, 2));
+            else yc = (m / Math.pow(1 - p, 2)) * ((1 - 2 * p) + 2 * p * normX - Math.pow(normX, 2));
+        }
+        
+        return isUpper ? -(yc + yt) * chord : -(yc - yt) * chord;
+    }
+
+    function generateAirfoil() {
+        const chord = 380; 
+        let upper = [], lower = [];
+        for (let i = 0; i <= 100; i++) {
+            let beta = (i / 100) * Math.PI;
+            let normX = 0.5 * (1 - Math.cos(beta)); 
+            upper.push({ x: normX * chord, y: getSurfaceY(normX, true) });
+            lower.push({ x: normX * chord, y: getSurfaceY(normX, false) });
+        }
+        airfoilData = { upper, lower, chord };
+    }
+
+    // Advanced Vector Field Flow Calculation
+    function getVelocity(px, py) {
+        const cx = canvas.width / 2 - 140;
+        const cy = canvas.height / 2;
+        const chord = 380;
+        
+        // Proper clockwise Pitch-Up rotation matrix
+        const rad = (aoa * Math.PI) / 180; 
+        const dx = px - cx;
+        const dy = py - cy;
+        
+        const lx = dx * Math.cos(-rad) - dy * Math.sin(-rad);
+        const ly = dx * Math.sin(-rad) + dy * Math.cos(-rad);
+        const normX = lx / chord;
+        
+        let vx = speed;
+        let vy = 0;
+
+        if (lx > -150 && lx < chord + 300) {
+            let isUpper = ly < 0; 
+            
+            if (normX >= 0 && normX <= 1) {
+                let surfY = getSurfaceY(normX, isUpper);
+                let distToSurface = Math.abs(ly - surfY);
+
+                if (isUpper && normX > separationPointX) {
+                    // Viscous Wake Zone (Chaotic eddies)
+                    if (distToSurface < 120) { 
+                        vx = speed * 0.1 + (Math.random() - 0.5) * speed * 0.4;
+                        vy = (Math.random() - 0.5) * speed * 0.7;
+                    }
+                } else if (distToSurface < 100) {
+                    // Natural Streamline Deflection along surface
+                    let eps = 0.02;
+                    let nextY = getSurfaceY(Math.min(1, normX + eps), isUpper);
+                    let surfaceSlope = (nextY - surfY) / (eps * chord);
+                    
+                    let targetVy = vx * surfaceSlope;
+                    let blend = 1 - Math.pow(distToSurface / 100, 1.5);
+                    vy = vy * (1 - blend) + targetVy * blend;
+
+                    // No-slip boundary layer condition (Velocity decays near wall)
+                    if (distToSurface < 15) {
+                        let friction = Math.max(0.1, distToSurface / 15);
+                        vx *= friction;
+                        vy *= friction;
+                    }
+                }
+            } else if (normX < 0) {
+                // Stagnation & Upwash region
+                let distNose = Math.sqrt(lx*lx + ly*ly);
+                if (distNose < 150) {
+                    let factor = Math.max(0, 1 - distNose / 150);
+                    vy -= speed * 0.25 * (aoa / 12) * factor;
+                    vx *= (1 - 0.6 * factor); 
+                }
+            } else {
+                // Downwash & Trailing Wake
+                let distTail = lx - chord;
+                if (distTail < 200) {
+                    if (isStalled && Math.abs(ly) < 120) {
+                        vx = speed * 0.3 + (Math.random() - 0.5) * speed * 0.4;
+                        vy = (Math.random() - 0.5) * speed * 0.5;
+                    } else {
+                        vy += speed * 0.35 * (aoa / 15) * Math.exp(-distTail / 100);
+                    }
+                }
+            }
+        }
+
+        let globalVx = vx * Math.cos(rad) - vy * Math.sin(rad);
+        let globalVy = vx * Math.sin(rad) + vy * Math.cos(rad);
+        return { vx: globalVx, vy: globalVy };
+    }
+
+    // Particle System
+    class Particle {
+        constructor() { this.reset(true); }
+        reset(randomX = false) {
+            this.x = randomX ? Math.random() * canvas.width : 0;
+            this.y = Math.random() * canvas.height;
+            this.history = [];
+        }
+        update() {
+            this.history.push({x: this.x, y: this.y});
+            if (this.history.length > 22) this.history.shift();
+
+            let vel = getVelocity(this.x, this.y);
+            this.x += vel.vx; this.y += vel.vy;
+
+            if (this.x > canvas.width || this.y < -100 || this.y > canvas.height + 100) this.reset();
+        }
+        draw() {
+            ctx.beginPath();
+            ctx.strokeStyle = (isStalled && this.x > canvas.width/2 - 20 && Math.abs(this.y - canvas.height/2) < 130)
+                              ? 'rgba(239, 68, 68, 0.6)' : 'rgba(56, 189, 248, 0.45)';
+            ctx.lineWidth = 1.5;
+            this.history.forEach((pt, i) => i === 0 ? ctx.moveTo(pt.x, pt.y) : ctx.lineTo(pt.x, pt.y));
+            ctx.stroke();
+        }
+    }
+
+    let particles = [];
+    for (let i = 0; i < 400; i++) particles.push(new Particle());
+
+    // UI Infographics rendering perfectly tethered to geometry
+    function drawInfographics(cx, cy, rad) {
+        ctx.save();
+        ctx.translate(cx, cy);
+        ctx.rotate(rad); 
+        
+        ctx.font = "12px Segoe UI, sans-serif";
+        ctx.lineWidth = 1.5;
+        const chord = 380;
+
+        const drawLabel = (x, y, text, lineLenY, color) => {
+            ctx.beginPath();
+            ctx.strokeStyle = color; ctx.fillStyle = color;
+            ctx.arc(x, y, 4, 0, Math.PI * 2);
+            ctx.fill(); 
+            ctx.moveTo(x, y); 
+            ctx.lineTo(x, y + lineLenY); 
+            ctx.lineTo(x + 35, y + lineLenY); 
+            ctx.stroke();
+            ctx.fillStyle = "#ffffff"; 
+            ctx.fillText(text, x + 40, y + lineLenY + 4);
+        };
+
+        // 1. Stagnation Point
+        drawLabel(0, 0, "Stagnation Point (V ≈ 0)", 55, "#38bdf8");
+
+        // 2. Viscous Boundary Layer accurately resting on the exterior surface
+        let bl_normX = 0.3;
+        let exactSurfY = getSurfaceY(bl_normX, true); // true = upper surface
+        drawLabel(chord * bl_normX, exactSurfY, "Viscous Boundary Layer (u → 0.99U)", -55, "#38bdf8");
+
+        // 3. Separation Point / Stall Indicator
+        if (separationPointX < 0.95) {
+            let sepSurfY = getSurfaceY(separationPointX, true);
+            drawLabel(chord * separationPointX, sepSurfY, "Separation Point (du/dy = 0)", -85, "#ef4444");
+            
+            ctx.font = "bold 15px sans-serif";
+            ctx.fillStyle = "rgba(239, 68, 68, 0.85)";
+            ctx.fillText("TURBULENT WAKE", chord * 0.75, -115);
+        }
+        ctx.restore();
+    }
+
+    // Main render loop
+    function animate() {
+        if (renderMode === 'particle') {
+            ctx.fillStyle = 'rgba(2, 6, 23, 0.35)'; // Motion blur trail
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+            particles.forEach(p => { p.update(); p.draw(); });
+        } else {
+            ctx.fillStyle = '#020617';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+            
+            ctx.strokeStyle = 'rgba(56, 189, 248, 0.5)';
+            ctx.lineWidth = 1.5;
+            
+            for (let startY = -80; startY < canvas.height + 80; startY += 15) {
+                ctx.beginPath();
+                let curX = 0, curY = startY;
+                ctx.moveTo(curX, curY);
+                for (let step = 0; step < 300; step++) {
+                    let vel = getVelocity(curX, curY);
+                    curX += vel.vx * 1.5; curY += vel.vy * 1.5;
+                    ctx.lineTo(curX, curY);
+                    if (curX > canvas.width) break;
+                }
+                ctx.stroke();
+            }
+        }
+
+        const cx = canvas.width / 2 - 140;
+        const cy = canvas.height / 2;
+        const rad = (aoa * Math.PI) / 180;
+
+        ctx.save();
+        ctx.translate(cx, cy);
+        ctx.rotate(rad);
+        
+        // Draw Airfoil accurately
+        ctx.beginPath();
+        ctx.fillStyle = "#64748b"; 
+        ctx.strokeStyle = "#e2e8f0"; 
+        ctx.lineWidth = 2;
+        
+        // Upper surface LE to TE
+        airfoilData.upper.forEach((pt, i) => {
+            if (i === 0) ctx.moveTo(pt.x, pt.y);
+            else ctx.lineTo(pt.x, pt.y);
+        });
+        
+        // Lower surface TE to LE (safe backward loop prevents array mutation crashes)
+        for(let i = airfoilData.lower.length - 1; i >= 0; i--) {
+            ctx.lineTo(airfoilData.lower[i].x, airfoilData.lower[i].y);
+        }
+        
+        ctx.closePath();
+        ctx.fill(); 
+        ctx.stroke(); 
+        ctx.restore();
+
+        drawInfographics(cx, cy, rad);
+        requestAnimationFrame(animate);
+    }
+
+    // Input Listeners
+    const updateAll = () => {
+        UI.aoaVal.innerText = parseFloat(UI.aoa.value).toFixed(1) + "°";
+        UI.speedVal.innerText = UI.speed.value + " kt";
+        updatePhysicsState(); 
+        generateAirfoil();
+    };
+
+    UI.m.oninput = updateAll; UI.p.oninput = updateAll; UI.t.oninput = updateAll;
+    UI.aoa.oninput = updateAll; UI.speed.oninput = updateAll;
+    UI.mode.onchange = (e) => { renderMode = e.target.value; if(renderMode === 'particle') particles.forEach(p=>p.reset(true)); };
+
+    // Start App
+    updateAll(); 
+    animate();
+</script>
+</body>
+</html>
